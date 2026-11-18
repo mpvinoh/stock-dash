@@ -1,0 +1,18 @@
+[project]
+name = "stock-dashboard"
+version = "0.3.3"
+description = "股票分析小幫手：波浪黃金分割、有效K起漲確認、多因子評分、起漲雷達與 AI 分析師"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.50",
+    "yfinance>=0.2.50",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "plotly>=5.24",
+    "google-genai>=1.0.0",
+    "requests>=2.31.0",
+    "pyarrow>=15.0.0",
+]
+
+[tool.uv]
+package = false
