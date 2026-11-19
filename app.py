@@ -17,7 +17,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from ai import BEST_MODEL, analyst_comment, classify_news, news_to_score, rule_based_comment
+from ai import BEST_MODEL, analyst_comment, chat_reply, classify_news, news_to_score, pulse_comment, rule_based_comment
 from analysis import (
     CHIPS_MIN,
     RR_MIN,
@@ -33,6 +33,7 @@ from analysis import (
 from data import parse_inputs
 from factors import FACTOR_NAMES, WEIGHTS, explain_chips, explain_fund, explain_us_flow, explain_value
 from keybar import DAILY, WEEKLY
+from live_pulse import PROFILES, market_status_now, scan_live_pulse
 from model import HORIZONS, MIN_REVERSAL, NO_REVERSAL_CAP, backtest, explain, performance
 from scanner import fetch_quotes, load_last_scan, scan, scan_us
 from sources import is_taiwan
@@ -123,6 +124,19 @@ def ensure_names() -> bool:
         return False
 
 
+@st.cache_data(ttl=240, show_spinner=False)
+def cached_pulse(watch_tickers: tuple[str, ...], profile_key: str, scope: str = "auto") -> dict:
+    """0-Token 盤中／最新盤面異動巡邏（雲端多人共用 4 分鐘快取）。"""
+    return scan_live_pulse(list(watch_tickers), profile_key=profile_key, scope=scope)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_pulse_ai(_key: str, sig: str, events_json: str, profile_key: str, session_label: str, model: str) -> tuple[str, str]:
+    """相同異動指紋 60 分鐘內共用同一段 AI 播報，避免重複消耗 Token。"""
+    tone = PROFILES.get(profile_key, PROFILES["normal"])["tone"]
+    return pulse_comment(_key, json.loads(events_json), profile_key, tone, session_label, model)
+
+
 def model_note(used: str) -> str:
     if used == GEMINI_MODEL:
         tier = "（免費層級）" if used != BEST_MODEL else ""
@@ -144,6 +158,9 @@ if "watchlist" not in ss:
 ss.setdefault("threshold", 70)
 ss.setdefault("period", "1年")
 ss.setdefault("color_scheme", "tw")
+ss.setdefault("ai_profile", "normal")
+ss.setdefault("pulse_chat", [])
+ss.setdefault("pulse_manual", False)
 
 
 def add_items(items: list[str]) -> None:
@@ -373,6 +390,131 @@ kb = res["keybar"]
 sr = res["sr"]
 is_tw = is_taiwan(res["ticker"])
 unit = cur_unit(res["ticker"])
+
+# ---------------------------------------------------------------------------
+# 🤖 AI 盤中互動戰情助理（@st.fragment 局部自動巡邏，不打斷看圖；兩段式省 Token）
+# ---------------------------------------------------------------------------
+_watch_tickers = tuple(sorted(r["ticker"] for r in stocks.values()))
+_ticker_to_key = {r["ticker"]: k for k, r in stocks.items()}
+_mkt_now = market_status_now()
+_prof_key = ss.get("ai_profile") if ss.get("ai_profile") in PROFILES else "normal"
+_run_every = PROFILES[_prof_key]["interval_sec"] if (_prof_key != "off" and _mkt_now["any_open"]) else None
+
+
+def _render_live_assistant():
+    st_now = market_status_now()
+    cur_prof = ss.get("ai_profile") if ss.get("ai_profile") in PROFILES else "normal"
+    with st.container(border=True):
+        c_title, c_prof, c_btn = st.columns([2.2, 2.8, 1.1], vertical_alignment="center")
+        c_title.markdown(f"**🤖 AI 盤中互動助理**　<span style='font-size:0.86rem;color:#666'>{st_now['label']}</span>", unsafe_allow_html=True)
+        picked_prof = c_prof.segmented_control(
+            "主動提示等級",
+            options=list(PROFILES),
+            default=cur_prof,
+            format_func=lambda k: PROFILES[k]["label"],
+            key="ai_profile_ctrl",
+            label_visibility="collapsed",
+        )
+        if picked_prof and picked_prof != cur_prof:
+            ss["ai_profile"] = picked_prof
+            st.rerun(scope="app")
+
+        manual_hit = c_btn.button("⚡ 立即巡邏", key="btn_pulse_now", width="stretch", help="馬上掃描觀察名單＋台美熱門股的最新量價異動")
+        if manual_hit:
+            cached_pulse.clear()
+            ss["pulse_manual"] = True
+
+        if cur_prof == "off" and not manual_hit and not ss.get("pulse_manual"):
+            st.caption("已設為「🔇 不主動提示」，背景自動巡邏已關閉（0 Token 消耗）；想看最新異動可隨時按右邊「⚡ 立即巡邏」。")
+            return
+
+        should_run = st_now["any_open"] or ss.get("pulse_manual") or manual_hit
+        if not should_run:
+            st.caption(
+                f"{PROFILES[cur_prof]['desc']}。休市期間自動休眠（0 Token）；點右邊 **「⚡ 立即巡邏」** 可立刻體驗最新交易日的互動快報！"
+            )
+            return
+
+        active_prof = "normal" if cur_prof == "off" else cur_prof
+        with st.spinner("🤖 正在巡邏觀察名單與台美熱門股量價異動…"):
+            pulse = cached_pulse(_watch_tickers, active_prof, "auto")
+        ss["last_pulse"] = pulse
+        evs = pulse["events"]
+        ev_json = json.dumps(evs, ensure_ascii=False)
+        ai_msg, ai_src = cached_pulse_ai(GEMINI_KEY, pulse["signature"], ev_json, active_prof, pulse["status"]["label"], GEMINI_MODEL)
+
+        if evs and pulse["signature"] != ss.get("toasted_pulse_sig"):
+            ss["toasted_pulse_sig"] = pulse["signature"]
+            top0 = evs[0]
+            st.toast(
+                f"🤖 {top0['flag']} {top0['name']}：{top0['tag_str']}（{top0['ret_pct']:+.1f}%，量比 {top0['vol_ratio']:.1f}x）",
+                icon="⚡",
+            )
+
+        with st.chat_message("assistant"):
+            st.markdown(ai_msg)
+            src_note = "0-Token 規則" if ai_src in ("0-token", "rule", "fallback") else f"AI `{ai_src}`（60 分鐘共用快取省額度）"
+            st.caption(f"巡邏時間 {pulse['checked_at']}｜已掃 {pulse['scanned']} 檔｜{PROFILES[active_prof]['label']}｜{src_note}")
+
+        if evs:
+            ecols = st.columns(min(len(evs), 4))
+            for idx, e in enumerate(evs[:4]):
+                with ecols[idx].container(border=True):
+                    badge = "📌 名單內" if e["in_watch"] else "✨ 熱門發現"
+                    st.markdown(f"**{e['flag']} {e['name']}**  \n<span style='font-size:0.82rem;color:#666'>{badge}</span>", unsafe_allow_html=True)
+                    st.caption(e["tag_str"])
+                    st.markdown(f"`{e['close']:,.2f}`（**{e['ret_pct']:+.1f}%**）｜量 **{e['vol_ratio']:.1f}x**")
+                    btn_txt = "📈 切去看圖" if e["in_watch"] else "➕ 加入看圖"
+                    if st.button(btn_txt, key=f"pulse_go_{e['ticker']}_{idx}", width="stretch"):
+                        if e["in_watch"] and e["ticker"] in _ticker_to_key:
+                            ss.focus_pill = _ticker_to_key[e["ticker"]]
+                        else:
+                            add_items([e["code"]])
+                        st.rerun(scope="app")
+
+        # 輕量接話互動區
+        with st.expander("💬 跟 AI 助理接話互動（點快捷問題或直接發問）", expanded=bool(ss.get("pulse_chat"))):
+            q1, q2, q3, q4 = st.columns([1.4, 1.4, 1.4, 0.7])
+            quick_q = None
+            if q1.button("🤔 剛報的這幾檔現在追安全嗎？", key="pq_1", width="stretch"):
+                quick_q = "剛巡邏報出來的這幾檔，哪一檔比較接近健康起漲、哪一檔追高風險比較大？"
+            if q2.button(f"🛡️ {res['name']} 現在怎麼設停損？", key="pq_2", width="stretch"):
+                quick_q = f"以目前我正在看的 {res['name']} 來說，波浪位置和停損防線應該怎麼設比較穩？"
+            if q3.button("🌦️ 今天盤面適合積極還是觀望？", key="pq_3", width="stretch"):
+                quick_q = "結合現在的大盤氣象跟剛巡邏到的盤面異動，今天比較適合積極找買點還是保守觀望？"
+            if q4.button("🧹 清空", key="pq_clear", width="stretch"):
+                ss["pulse_chat"] = []
+
+            for m in ss.get("pulse_chat", [])[-6:]:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+
+            with st.form("pulse_chat_form", clear_on_submit=True):
+                fc1, fc2 = st.columns([5, 1], vertical_alignment="center")
+                typed_q = fc1.text_input("問 AI 助理", placeholder="輸入問題，例如：這檔跟台積電比哪個風報比較好？", label_visibility="collapsed")
+                sent = fc2.form_submit_button("送出", width="stretch")
+
+            ask_q = quick_q or (typed_q.strip() if sent and typed_q.strip() else None)
+            if ask_q:
+                ss.setdefault("pulse_chat", []).append({"role": "user", "content": ask_q})
+                cur_ctx = (
+                    build_context(res, comp, label[1], notes, res["news_scored"], res["bt_stats"])
+                    if not pd.isna(timing)
+                    else {"股票": res["name"], "幣別": "台幣" if is_tw else "美元", "收盤價": float(d["Close"].iloc[-1])}
+                )
+                with st.spinner("🤖 AI 思考中…"):
+                    try:
+                        ans, _ = chat_reply(
+                            GEMINI_KEY, ask_q, cur_ctx, evs, ss["pulse_chat"][:-1],
+                            PROFILES[active_prof]["tone"], GEMINI_MODEL,
+                        )
+                    except Exception as err:
+                        ans = f"AI 暫時忙碌中（{str(err)[:80]}），請稍後再試。"
+                ss["pulse_chat"].append({"role": "assistant", "content": ans})
+                st.rerun()
+
+
+st.fragment(run_every=_run_every)(_render_live_assistant)()
 
 main_tabs = st.tabs(["🔍 個股分析", "🚀 起漲雷達（台股／美股）", "🏠 名單總覽與比較", "📖 使用說明"])
 tab_stock, tab_scan, tab_home, tab_help = main_tabs
@@ -1059,6 +1201,14 @@ with tab_stock:
 # ===========================================================================
 with tab_scan:
     st.markdown("#### 🚀 起漲雷達：掃描名單外「剛啟動」「準備啟動」「拉回買點」的股票")
+    # 若剛做過盤中巡邏，也在起漲雷達頂部同步顯示即時量價異動快訊
+    lp = ss.get("last_pulse")
+    if lp and lp.get("events"):
+        lp_txt = "　｜　".join(
+            f"**{e['flag']} {e['name']}** {e['tag_str']}（{e['ret_pct']:+.1f}%／量 {e['vol_ratio']:.1f}x）"
+            for e in lp["events"][:3]
+        )
+        st.success(f"⚡ **盤中即時異動快訊（{lp['checked_at']}）**：{lp_txt}")
     m_col, s_col, b_col = st.columns([1.8, 1.8, 1.2], vertical_alignment="bottom")
     radar_mkt = m_col.segmented_control(
         "選擇市場",
@@ -1235,6 +1385,11 @@ with tab_help:
   - **大盤基準**：台股對比 `0050`，美股對比 `SPY`（S&P 500）。
   - **籌碼面**：台股有每日三大法人與融資（含籌碼濾網）；美股制度無此資料，改顯示**機構持股 %、空單比例與 OBV 資金流**（參考用）。
   - **基本面與部位計算機**：台股看月營收／季報／台幣張數；美股看季報圖表／預估本益比／華爾街目標價／美元股數。
+
+### 🤖 AI 盤中互動助理（4 段頻率／個性，省 Token 兩段式設計）
+- **4 種互動等級**：`🔥 積極熱情（5 分鐘）`、`🙂 普通（15 分鐘）`、`🧘 沉穩（30 分鐘）`、`🔇 不主動提示（關閉）`。
+- **低 Token 消耗設計**：第一關先由程式（0 Token）掃描觀察名單＋台美熱門股，只在發現**疑似大資金放量點火、突破／逼近 20 日高、或觀察名單急跌**時，才由 AI 寫 2–3 句口語互動；同一組異動 60 分鐘內共用快取、休市時段自動休眠。
+- **提醒**：盤中量能放大是依據開盤進度估算全天預估量（代理訊號），並非真實券商分點即時大戶明細；不會發聲、也不會在關掉網頁後推送手機通知。
 
 ### 🤖 AI 分析師
 整合所有技術波浪、有效K、籌碼／資金流、財報估值、新聞與風控價位交給 Gemini（目前 `{GEMINI_MODEL}`，失敗自動退回其他 Flash 模型），產出白話結論、多空辯論與 If-Then 操作劇本。

@@ -12,7 +12,7 @@ import re
 # 實測（免費層級）：argon 回 429 額度不足；3.8 / 3.7 Flash 常逾時；3.6 / 3.5 Flash 2–3 秒
 BEST_MODEL = "gemini-4-argon"
 FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
-TIMEOUT_MS = 60_000
+TIMEOUT_MS = 35_000
 _dead_models: set[str] = set()  # 這次執行中確定不能用的模型，之後跳過
 
 SYSTEM_PROMPT = """你是一位說話親切、務實、精通「艾略特波浪理論與黃金分割」與「多因子量化風控」的台股與美股分析師，用繁體中文、口語化的方式向一般投資人解說。
@@ -54,25 +54,33 @@ ANALYST_FORMAT = """請用以下格式回答（Markdown，總長約 450–700 �
 **（提醒）**"""
 
 
-def _client(api_key: str):
+def _client(api_key: str, timeout_ms: int = TIMEOUT_MS):
     from google import genai
     from google.genai import types
 
     return genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=1)),
+        http_options=types.HttpOptions(timeout=timeout_ms, retry_options=types.HttpRetryOptions(attempts=1)),
     )
 
 
-def _generate(api_key: str, prompt: str, json_mode: bool = False, model: str = "") -> tuple[str, str]:
+def _generate(
+    api_key: str,
+    prompt: str,
+    json_mode: bool = False,
+    model: str = "",
+    system: str | None = SYSTEM_PROMPT,
+    temperature: float = 0.3,
+    timeout_ms: int = TIMEOUT_MS,
+) -> tuple[str, str]:
     """依序嘗試模型，成功就回傳（文字、實際使用的模型）。"""
     from google.genai import types
 
-    client = _client(api_key)
+    client = _client(api_key, timeout_ms=timeout_ms)
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT if not json_mode else None,
+        system_instruction=None if json_mode else system,
         response_mime_type="application/json" if json_mode else None,
-        temperature=0.3,
+        temperature=temperature,
     )
     models = [model or BEST_MODEL] + [m for m in FALLBACK_MODELS if m != model]
     candidates = [m for m in models if m not in _dead_models] or models
@@ -84,10 +92,10 @@ def _generate(api_key: str, prompt: str, json_mode: bool = False, model: str = "
                 return r.text, m
         except Exception as e:  # 模型不存在、逾時、額度不足等，換下一個
             last_err = e
-            msg = str(e)
-            if "API key" in msg or "PERMISSION_DENIED" in msg:
+            msg = f"{type(e).__name__}: {e}".lower()
+            if "api key" in msg or "permission_denied" in msg:
                 break
-            if "NOT_FOUND" in msg or "DEADLINE" in msg or "timed out" in msg.lower():
+            if any(k in msg for k in ("not_found", "deadline", "timed out", "timeout", "resource_exhausted", "429")):
                 _dead_models.add(m)
     raise RuntimeError(f"Gemini 呼叫失敗：{last_err}")
 
@@ -108,7 +116,7 @@ def classify_news(api_key: str, stock_name: str, news: list[dict], model: str = 
 
 {titles}"""
     try:
-        text, used = _generate(api_key, prompt, json_mode=True, model=model)
+        text, used = _generate(api_key, prompt, json_mode=True, model=model, timeout_ms=15_000)
         text = re.sub(r"^```(json)?|```$", "", text.strip()).strip()
         result = {int(x["i"]): x for x in json.loads(text)}
     except Exception as e:
@@ -192,3 +200,111 @@ def rule_based_comment(context: dict) -> str:
         "_（設定 Gemini 金鑰後，這裡會改由 AI 用口語化方式解讀波浪位置、多空辯論與 If-Then 劇本）_",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 盤中主動互動播報 & 輕量戰情聊天（極低 Token 設計）
+# ---------------------------------------------------------------------------
+def rule_based_pulse_comment(events: list[dict], profile_key: str, session_label: str) -> str:
+    """沒有 AI 或額度暫滿時的規則式盤中播報（0 Token）。"""
+    if not events:
+        if profile_key == "enthusiastic":
+            return f"👀 剛巡邏完一輪（{session_label}），目前熱門股跟名單都還在整理蓄力中，還沒看到明顯放量點火。等有風吹草動我馬上喊你！"
+        if profile_key == "calm":
+            return f"目前（{session_label}）無重大突破或風險警訊，維持紀律觀望即可。"
+        return f"剛巡邏完最新盤面（{session_label}），暫時沒有符合門檻的量價異動，有訊號會再提醒你。"
+    top = events[0]
+    others = "、".join(f"{e['flag']}{e['name']}" for e in events[1:3])
+    extra = f"；另外 {others} 也有異動" if others else ""
+    if profile_key == "enthusiastic":
+        return (
+            f"🔥 發現亮點！**{top['flag']} {top['name']}**（{top['tag_str']}），{top['detail']}{extra}！"
+            "要直接點下方按鈕切過去看 K 線圖，還是讓我幫你評估追高風險？"
+        )
+    if profile_key == "calm":
+        return f"重點提醒：**{top['flag']} {top['name']}** 出現「{top['tag_str']}」（{top['detail']}）{extra}。建議先確認支撐與停損位置。"
+    return f"盤面快報：**{top['flag']} {top['name']}** 出現「{top['tag_str']}」— {top['detail']}{extra}。點下方卡片可直接切換看圖。"
+
+
+def pulse_comment(
+    api_key: str,
+    events: list[dict],
+    profile_key: str,
+    tone_desc: str,
+    session_label: str,
+    model: str = "",
+) -> tuple[str, str]:
+    """把 Python 篩出的 1–3 檔異動重點交給 AI 寫成 2–3 句有趣口語播報（約 500–700 tokens）。"""
+    if not events:
+        return rule_based_pulse_comment(events, profile_key, session_label), "0-token"
+    if not api_key:
+        return rule_based_pulse_comment(events, profile_key, session_label), "rule"
+
+    brief = [
+        {
+            "股票": f"{e['flag']}{e['name']}",
+            "在觀察名單": e["in_watch"],
+            "訊號": e["tag_str"],
+            "現價": e["close"],
+            "漲跌": f"{e['ret_pct']:+.1f}%",
+            "量比": f"{e['vol_ratio']:.1f}倍",
+            "說明": e["detail"],
+        }
+        for e in events[:3]
+    ]
+    sys_msg = (
+        "你是股票分析小幫手的盤中互動助理，用繁體中文口語跟使用者聊天播報。"
+        f"說話風格：{tone_desc}\n"
+        "嚴格規則：只能引用提供的數據；量能放大只能說是「量能異常放大／疑似大資金點火」，"
+        "不可宣稱看到實際券商大戶明細；不可保證漲跌；總字數控制在 80–160 字（2–3 句話，不要列長清單）。"
+    )
+    prompt = f"目前市場狀態：{session_label}\n剛偵測到的異動：\n{json.dumps(brief, ensure_ascii=False)}\n請寫一段簡短自然的互動提示。"
+    try:
+        return _generate(api_key, prompt, model=model or "gemini-3.6-flash", system=sys_msg, temperature=0.55, timeout_ms=15_000)
+    except Exception:
+        return rule_based_pulse_comment(events, profile_key, session_label), "fallback"
+
+
+def chat_reply(
+    api_key: str,
+    question: str,
+    focus_ctx: dict,
+    pulse_events: list[dict],
+    history: list[dict],
+    tone_desc: str,
+    model: str = "",
+) -> tuple[str, str]:
+    """盤中互動助理對話回覆（精簡 Context，控制 Token 消耗）。"""
+    if not api_key:
+        return "目前沒有設定 Gemini API 金鑰，請先到右上角「⚙️ 設定」填入自己的金鑰，或設定 secrets.toml 後就能開始對話。", "none"
+
+    compact_focus = {
+        "目前查看股票": focus_ctx.get("股票"),
+        "幣別": focus_ctx.get("幣別"),
+        "收盤價": focus_ctx.get("收盤價"),
+        "買進時機分數": focus_ctx.get("買進時機分數（技術與波浪，0-100）"),
+        "買進建議": focus_ctx.get("買進建議"),
+        "波浪": focus_ctx.get("波浪理論與黃金分割"),
+        "有效K": focus_ctx.get("有效K棒起漲訊號（第二套獨立訊號，和買進時機分數分開）"),
+        "壓力支撐與ATR風控": focus_ctx.get("壓力支撐與ATR風控"),
+        "籌碼面": focus_ctx.get("籌碼面"),
+        "大盤與RS": focus_ctx.get("大盤環境與相對強弱"),
+    }
+    compact_pulse = [
+        {"股票": f"{e['flag']}{e['name']}", "訊號": e["tag_str"], "價": e["close"], "漲跌": f"{e['ret_pct']:+.1f}%", "量比": f"{e['vol_ratio']:.1f}x"}
+        for e in (pulse_events or [])[:5]
+    ]
+    recent_hist = "\n".join(f"{'使用者' if m['role'] == 'user' else '助理'}：{m['content']}" for m in history[-6:])
+    sys_msg = (
+        "你是股票分析小幫手的盤中互動助理，用繁體中文回答使用者提問。"
+        f"說話風格：{tone_desc}\n"
+        "規則：只能依據提供的數據回答，不可編造數字或新聞；若問到清單以外的股票，請提醒使用者先在上方搜尋框加入觀察名單；"
+        "回答精簡務實（150–280 字內），結尾提醒僅供參考、非投資建議。"
+    )
+    prompt = (
+        f"【目前個股摘要】\n{json.dumps(compact_focus, ensure_ascii=False, default=str)}\n\n"
+        f"【最新巡邏異動】\n{json.dumps(compact_pulse, ensure_ascii=False)}\n\n"
+        + (f"【近期對話】\n{recent_hist}\n\n" if recent_hist else "")
+        + f"【使用者提問】\n{question}"
+    )
+    return _generate(api_key, prompt, model=model or "gemini-3.6-flash", system=sys_msg, temperature=0.4, timeout_ms=25_000)
