@@ -157,13 +157,18 @@ def fundamental_frame(index: pd.DatetimeIndex, revenue: pd.DataFrame, fin: pd.Da
 def explain_fund(f: pd.DataFrame, us: dict | None = None) -> list[str]:
     if us:
         lines = []
+        if us.get("sector"):
+            cap = f"，市值約 {us['market_cap'] / 1e9:,.0f} 億美元" if us.get("market_cap") else ""
+            lines.append(f"產業：{us['sector']}{cap}")
         if us.get("rev_yoy") is not None:
             lines.append(f"最新一季營收年增 {us['rev_yoy']:+.1%}")
-        if us.get("eps_growth") is not None:
-            lines.append(f"近四季 EPS {us['eps_ttm']:.2f}，年增 {us['eps_growth']:+.1%}")
+        if us.get("eps_ttm") is not None:
+            g_str = f"，年增 {us['eps_growth']:+.1%}" if us.get("eps_growth") is not None else ""
+            lines.append(f"近四季 EPS {us['eps_ttm']:.2f} 美元{g_str}")
         if us.get("gm") is not None:
-            lines.append(f"毛利率 {us['gm']:.1%}（比去年同季 {us['gm_change'] * 100:+.1f} 個百分點）")
-        return lines or ["沒有基本面資料"]
+            gc = f"（比去年同季 {us['gm_change'] * 100:+.1f} 個百分點）" if us.get("gm_change") is not None else ""
+            lines.append(f"毛利率 {us['gm']:.1%}{gc}")
+        return lines or ["沒有基本面資料（ETF 不適用）"]
     if f.empty or "score" not in f or f["score"].dropna().empty:
         return ["沒有基本面資料（ETF 不適用）"]
     r = f.iloc[-1]
@@ -201,6 +206,40 @@ def us_fund_score(us: dict) -> float:
     return pts / mx * 25 if mx else np.nan
 
 
+def us_flow_frame(d: pd.DataFrame) -> pd.DataFrame:
+    """美股價量籌碼替代指標：OBV 能量潮（累積量能）與近 20 日紅K／黑K量比。"""
+    f = pd.DataFrame(index=d.index)
+    if d.empty or "Volume" not in d:
+        return f
+    c, v = d["Close"], d["Volume"].fillna(0)
+    direction = np.sign(c.diff().fillna(0))
+    f["obv"] = (direction * v).cumsum()
+    f["obv_ma20"] = f["obv"].rolling(20).mean()
+    up_v = v.where(c >= d["Open"], 0.0).rolling(20).sum()
+    tot_v = v.rolling(20).sum().replace(0, np.nan)
+    f["up_vol_ratio"] = up_v / tot_v
+    return f
+
+
+def explain_us_flow(flow: pd.DataFrame, us: dict | None = None) -> list[str]:
+    """整理美股機構持股、空單比例與 OBV 資金流的白話說明。"""
+    lines: list[str] = []
+    if us:
+        if us.get("inst_pct") is not None:
+            lines.append(f"機構持股比例：{us['inst_pct']:.1%}" + (f"（內部人 {us['insider_pct']:.1%}）" if us.get("insider_pct") is not None else ""))
+        if us.get("short_float") is not None:
+            sr_txt = f"，回補天數 {us['short_ratio']:.1f} 天" if us.get("short_ratio") is not None else ""
+            warn = " ⚠️ 空單偏高（留意軋空或基本面分歧）" if us["short_float"] >= 0.10 else ""
+            lines.append(f"空單佔流通股：{us['short_float']:.1%}{sr_txt}{warn}")
+    if not flow.empty and pd.notna(flow["obv_ma20"].iloc[-1]):
+        obv_now, obv_ma = flow["obv"].iloc[-1], flow["obv_ma20"].iloc[-1]
+        uv = flow["up_vol_ratio"].iloc[-1]
+        lines.append(f"OBV 能量潮目前在 20 日均線之{'上（資金偏流入 👍）' if obv_now >= obv_ma else '下（資金偏流出 ⚠️）'}")
+        if pd.notna(uv):
+            lines.append(f"近 20 日紅 K 成交量佔比 {uv:.0%}（高於 55% 代表拉抬有量、低於 45% 代表殺盤帶量）")
+    return lines or ["美股沒有每日三大法人與融資資料，僅顯示價量資金流參考"]
+
+
 # ---------------------------------------------------------------------------
 # 估值（10）：本益比在近 5 年的百分位
 # ---------------------------------------------------------------------------
@@ -219,8 +258,24 @@ def value_frame(index: pd.DatetimeIndex, per: pd.Series) -> pd.DataFrame:
 
 
 def explain_value(f: pd.DataFrame, us: dict | None = None) -> list[str]:
-    if us and us.get("pe"):
-        return [f"本益比約 {us['pe']:.1f} 倍（美股沒有歷史本益比資料，不列入評分）"]
+    if us:
+        lines = []
+        if us.get("pe") is not None or us.get("forward_pe") is not None:
+            parts = []
+            if us.get("pe") is not None:
+                parts.append(f"過去本益比 {us['pe']:.1f} 倍")
+            if us.get("forward_pe") is not None:
+                parts.append(f"預估本益比 {us['forward_pe']:.1f} 倍")
+            lines.append("、".join(parts) + "（參考用，美股無歷史 PE 序列不列入回測計分）")
+        if us.get("peg") is not None:
+            tag = "（< 1.2 相對合理 👍）" if us["peg"] < 1.2 else "（> 2.5 估值偏貴 ⚠️）" if us["peg"] > 2.5 else ""
+            lines.append(f"PEG 本益成長比：{us['peg']:.2f}{tag}")
+        if us.get("target_mean") is not None:
+            rec_map = {"strong_buy": "強力買進", "buy": "買進", "hold": "持有", "underperform": "劣於大盤", "sell": "賣出"}
+            rec = rec_map.get(us.get("rec_key", ""), "")
+            rec_txt = f"（分析師共識：{rec}）" if rec else ""
+            lines.append(f"華爾街分析師平均目標價：{us['target_mean']:,.2f} 美元{rec_txt}")
+        return lines or ["沒有估值資料（ETF 不適用）"]
     if f.empty or "score" not in f or f["score"].dropna().empty:
         return ["沒有本益比資料（ETF 不適用）"]
     r = f.iloc[-1]

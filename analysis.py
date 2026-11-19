@@ -13,9 +13,11 @@ from factors import (
     composite,
     explain_chips,
     explain_fund,
+    explain_us_flow,
     explain_value,
     fundamental_frame,
     support_resistance,
+    us_flow_frame,
     us_fund_score,
     value_frame,
 )
@@ -137,6 +139,7 @@ def analyze(user_input: str, token: str = "") -> dict:
         res["fin"] = fetch_financials(ticker, token)
         res["fund"] = fundamental_frame(d.index, res["revenue"], res["fin"])
         res["value"] = value_frame(d.index, fetch_per(ticker, token))
+        res["us_flow"] = pd.DataFrame()
     else:
         us = fetch_us_fundamentals(ticker)
         res["us"] = us
@@ -147,6 +150,7 @@ def analyze(user_input: str, token: str = "") -> dict:
             fund.iloc[-1, 0] = us_fund_score(us)
         res["fund"] = fund
         res["value"] = pd.DataFrame(index=d.index)
+        res["us_flow"] = us_flow_frame(d)
 
     res["news"] = fetch_news(ticker, token)
     res["sr"] = support_resistance(d)
@@ -212,9 +216,15 @@ def build_context(res: dict, comp: pd.DataFrame, label: str, notes: list[str], n
     fs = factor_summary(comp)
     ok = chips_ok_series(res)
 
+    is_tw = is_taiwan(res["ticker"])
+    etf_flag = is_etf(res["ticker"]) or (res.get("us") or {}).get("quote_type") == "ETF"
+    kind_label = ("台股ETF" if is_tw else "美股ETF") if etf_flag else ("台股" if is_tw else "美股")
+    chip_notes = explain_chips(res["chips"], res["chips_raw"]) if is_tw else explain_us_flow(res.get("us_flow", pd.DataFrame()), res.get("us"))
+
     ctx = {
         "股票": res["name"],
-        "類型": "台股ETF" if is_etf(res["ticker"]) else "台股" if is_taiwan(res["ticker"]) else "美股",
+        "類型": kind_label,
+        "幣別": "台幣" if is_tw else "美元",
         "資料日期": f"{d.index[-1]:%Y-%m-%d}",
         "收盤價": round(float(row["Close"]), 2),
         "近5日漲跌": f"{row['Close'] / d['Close'].iloc[-6] - 1:+.1%}",
@@ -254,7 +264,7 @@ def build_context(res: dict, comp: pd.DataFrame, label: str, notes: list[str], n
             "細節": sum(info["parts"].values(), []),
             "扣分": info["penalty"],
         },
-        "籌碼面": explain_chips(res["chips"], res["chips_raw"]),
+        "籌碼面": chip_notes,
         "基本面": explain_fund(res["fund"], res["us"]),
         "估值": explain_value(res["value"], res["us"]),
         "壓力支撐與ATR風控": {

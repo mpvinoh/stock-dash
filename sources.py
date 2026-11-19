@@ -30,9 +30,16 @@ def stock_id(ticker: str) -> str:
     return ticker.split(".")[0]
 
 
+US_ETFS = {
+    "SPY", "VOO", "VTI", "IVV", "QQQ", "QQQM", "DIA", "IWM", "SOXX", "SMH",
+    "SCHD", "TLT", "GLD", "SLV", "ARKK", "VGT", "VT", "EWT", "XLK", "XLF", "XLE", "XLV", "XLI",
+}
+
+
 def is_etf(ticker: str) -> bool:
-    """台股 ETF 代號以 00 開頭。"""
-    return is_taiwan(ticker) and stock_id(ticker).startswith("00")
+    """台股 ETF（00 開頭）或常見美股 ETF。"""
+    sid = stock_id(ticker).upper()
+    return (is_taiwan(ticker) and sid.startswith("00")) or (not is_taiwan(ticker) and sid in US_ETFS)
 
 
 def _finmind_raw(dataset: str, sid: str, start: str, token: str = "", end: str | None = None) -> pd.DataFrame | None:
@@ -177,33 +184,121 @@ def fetch_financials(ticker: str, token: str = "") -> pd.DataFrame:
     return q
 
 
-def fetch_us_fundamentals(ticker: str) -> dict:
-    """美股：用 Yahoo Finance 的季報算出最新的成長數字（只有現況，無法回測）。"""
+def _safe_float(v) -> float | None:
+    try:
+        if v is None or pd.isna(v):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def fetch_us_fundamentals(ticker: str, ttl_hours: float = 12.0) -> dict:
+    """美股：用 Yahoo Finance 抓取季報時間序列、估值、機構持股與空單比例（含硬碟快取）。"""
+    cache_file = CACHE_DIR / f"us_fund_{ticker.replace('.', '_')}.json"
+    if cache_file.exists():
+        age_hours = (time.time() - cache_file.stat().st_mtime) / 3600
+        if age_hours < ttl_hours:
+            try:
+                return json.loads(cache_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
     try:
         t = yf.Ticker(ticker)
         q = t.quarterly_income_stmt
-        info = t.get_info()
+        info = t.get_info() or {}
     except Exception:
+        if cache_file.exists():
+            try:
+                return json.loads(cache_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
         return {}
+
     out: dict = {}
+    quarters: list[dict] = []
     try:
-        q = q.T.sort_index()
-        if "Total Revenue" in q and len(q) >= 5:
-            rev = q["Total Revenue"].astype(float)
-            out["rev_yoy"] = rev.iloc[-1] / rev.iloc[-5] - 1
-        if "Diluted EPS" in q and len(q) >= 8:
-            eps = q["Diluted EPS"].astype(float)
-            ttm, prev = eps.iloc[-4:].sum(), eps.iloc[-8:-4].sum()
-            out["eps_ttm"] = ttm
-            out["eps_growth"] = (ttm / prev - 1) if prev > 0 else None
-        if {"Gross Profit", "Total Revenue"} <= set(q.columns) and len(q) >= 5:
-            gm = (q["Gross Profit"] / q["Total Revenue"]).astype(float)
-            out["gm"] = gm.iloc[-1]
-            out["gm_change"] = gm.iloc[-1] - gm.iloc[-5]
+        if q is not None and not q.empty:
+            qt = q.T.sort_index()
+            rev = qt["Total Revenue"].astype(float) if "Total Revenue" in qt else pd.Series(dtype=float)
+            eps = qt["Diluted EPS"].astype(float) if "Diluted EPS" in qt else pd.Series(dtype=float)
+            gp = qt["Gross Profit"].astype(float) if "Gross Profit" in qt else pd.Series(dtype=float)
+            gm_s = (gp / rev.replace(0, float("nan"))) if (len(gp) and len(rev)) else pd.Series(dtype=float)
+            yoy_s = (rev / rev.shift(4) - 1) if len(rev) >= 5 else pd.Series(dtype=float)
+
+            for dt_idx in qt.index[-8:]:
+                r_val = _safe_float(rev.get(dt_idx)) if len(rev) else None
+                e_val = _safe_float(eps.get(dt_idx)) if len(eps) else None
+                g_val = _safe_float(gm_s.get(dt_idx)) if len(gm_s) else None
+                y_val = _safe_float(yoy_s.get(dt_idx)) if len(yoy_s) else None
+                if any(x is not None for x in (r_val, e_val, g_val)):
+                    quarters.append({
+                        "date": f"{pd.Timestamp(dt_idx):%Y-%m-%d}",
+                        "revenue": r_val,
+                        "rev_yoy": y_val,
+                        "eps": e_val,
+                        "gross_margin": g_val,
+                    })
+
+            if len(rev.dropna()) >= 5:
+                r_clean = rev.dropna()
+                out["rev_yoy"] = float(r_clean.iloc[-1] / r_clean.iloc[-5] - 1)
+            if len(eps.dropna()) >= 8:
+                e_clean = eps.dropna()
+                ttm, prev = float(e_clean.iloc[-4:].sum()), float(e_clean.iloc[-8:-4].sum())
+                out["eps_ttm"] = ttm
+                out["eps_growth"] = (ttm / prev - 1) if prev > 0 else None
+            elif len(eps.dropna()) >= 4:
+                out["eps_ttm"] = float(eps.dropna().iloc[-4:].sum())
+            if len(gm_s.dropna()) >= 5:
+                g_clean = gm_s.dropna()
+                out["gm"] = float(g_clean.iloc[-1])
+                out["gm_change"] = float(g_clean.iloc[-1] - g_clean.iloc[-5])
+            elif len(gm_s.dropna()) >= 1:
+                out["gm"] = float(gm_s.dropna().iloc[-1])
     except Exception:
         pass
-    if info.get("trailingPE"):
-        out["pe"] = info["trailingPE"]
+
+    if quarters:
+        out["quarters"] = quarters
+
+    # 從 info 補齊估值、機構持股、空單比例與分析師目標價
+    field_map = {
+        "pe": "trailingPE",
+        "forward_pe": "forwardPE",
+        "peg": "trailingPegRatio",
+        "pb": "priceToBook",
+        "market_cap": "marketCap",
+        "inst_pct": "heldPercentInstitutions",
+        "insider_pct": "heldPercentInsiders",
+        "short_float": "shortPercentOfFloat",
+        "short_ratio": "shortRatio",
+        "target_mean": "targetMeanPrice",
+    }
+    for k, src_k in field_map.items():
+        val = _safe_float(info.get(src_k))
+        if val is not None:
+            out[k] = val
+    if "peg" not in out and _safe_float(info.get("pegRatio")) is not None:
+        out["peg"] = _safe_float(info.get("pegRatio"))
+    # 若季報缺最新營收年增或毛利率，改用 info 的 summary 補齊
+    if out.get("rev_yoy") is None and _safe_float(info.get("revenueGrowth")) is not None:
+        out["rev_yoy"] = _safe_float(info.get("revenueGrowth"))
+    if out.get("gm") is None and _safe_float(info.get("grossMargins")) is not None:
+        out["gm"] = _safe_float(info.get("grossMargins"))
+    if info.get("sector"):
+        out["sector"] = str(info["sector"])
+    if info.get("recommendationKey"):
+        out["rec_key"] = str(info["recommendationKey"])
+    if info.get("quoteType"):
+        out["quote_type"] = str(info["quoteType"])
+
+    if out:
+        try:
+            cache_file.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
     return out
 
 
